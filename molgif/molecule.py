@@ -23,15 +23,19 @@ import matplotlib.animation as anim
 
 # ensure that ImageMagick writer is found (and not Windows' convert.exe)
 if platform.system().lower().startswith('windows'):
-    if anim.rcParams['animation.convert_path'].endswith(('convert',
-                                                        'convert.exe')):
-        anim.rcParams['animation.convert_path'] = 'magick'
+    if 'rcParams' in anim.__dir__():
+        rc = anim.rcParams
+    else:
+        rc = matplotlib.rcParams
+
+    if rc['animation.convert_path'].endswith(('convert', 'convert.exe')):
+        rc['animation.convert_path'] = 'magick'
 
 
 class Molecule(object):
     def __init__(self, atoms, scale=0.7, name=None, square=False,
                  colors=None, labels=None, rot_axis=None,
-                 bond_color='white', bond_edgecolor='black',
+                 alphas=None, bond_color='white', bond_edgecolor='black',
                  cb_min=None, cb_max=None, center_data=False, cmap=cm.bwr_r,
                  draw=['atoms', 'bonds']):
         """
@@ -75,6 +79,10 @@ class Molecule(object):
                           - can also add a '-' to change direction!
                             e.g. '-z' causes clockwise rotation
                           (Default: 'y')
+
+        - alphas (int iterable dict): set transparency of atom type
+                                      or atom indices
+                                      (Default: None)
 
         - bond_color (str): specify color of bonds
                             (Default: white)
@@ -153,7 +161,10 @@ class Molecule(object):
         self.atom_borderwidth = 0.05
 
         # atom size scale (covalent_radii * scale)
-        self.scale = scale
+        self._scale = abs(float(scale))
+
+        # track to see when scale changes
+        self._prevscale = self._scale
 
         # get atomic radii based on scale
         self.radii = covalent_radii[self.atoms.numbers] * self.scale
@@ -180,14 +191,31 @@ class Molecule(object):
 
         # labels (write text on atoms)
         self._labels = None
+
+        # default label size: 15
+        self._label_size = 15
+
+        # flags used to block drawing colorbar and legend when not applicable
+        self.block_colorbar = False
+        self.block_legend = False
+
         self._check_labels(labels)
 
         # legend attributes (track order)
         self.legend = None
-        self.leg_order = None
+        self.leg_order = 'size'
+
+        # alpha value of atoms
+        self._alphas = [1.] * len(self.atoms)
+
+        if alphas is not None:
+            self.alphas = alphas
 
         # color attributes
-        self._colors = None
+        self._colors = [jmol_colors[a.number] for a in self.atoms]
+
+        # track if colors have changed
+        self._prevcolors = None
 
         # check input colors and see if they can be used with legend/colorbar
         self._check_colors(colors)
@@ -204,6 +232,30 @@ class Molecule(object):
 
     def __repr__(self):
         return 'molgif.Molecule(%s)' % self.atoms.get_chemical_formula()
+
+    def __getitem__(self, i):
+        return self.atoms[i]
+
+    @property
+    def alphas(self):
+        return self._alphas
+
+    @alphas.setter
+    def alphas(self, value):
+        changed = True
+        if isinstance(value, dict):
+            self._alphas = self._dict_to_list(value, self._alphas)[0]
+        elif ((isinstance(value, list) or isinstance(value, np.ndarray)) and
+              len(value) == len(self)):
+            self._alphas = list(value)
+        elif isinstance(value, int) or isinstance(value, float):
+            self._alphas = [value] * len(self)
+        else:
+            changed = False
+        if changed and self.fig is not None:
+            self.draw_atoms(force=True)
+            if 'bonds' in self.drawn:
+                self.draw_bonds()
 
     # colors getter
     @property
@@ -243,6 +295,40 @@ class Molecule(object):
     def labels(self, value):
         self._check_labels(value)
 
+    @property
+    def label_size(self):
+        return self._label_size
+
+    @label_size.setter
+    def label_size(self, value):
+        if isinstance(value, str) and not value.isdigit():
+            value = value.lower()
+            if re.match('(x{0,2}-)?(small|large)', value) or value == 'medium':
+                self._label_size = value
+        else:
+            try:
+                self._label_size = int(value)
+            except ValueError:
+                print('Label size must be point size or relative value '
+                      '(small, medium, etc.)')
+
+    @property
+    def scale(self):
+        """
+        """
+        return self._scale
+
+    @scale.setter
+    def scale(self, value):
+        try:
+            value = abs(float(value))
+            if value != self._scale:
+                self._scale = value
+                if 'atoms' in self._drawn:
+                    self.draw_atoms()
+        except (ValueError, TypeError):
+            print('Scale must be a number')
+
     # tracks items that have been drawn
     @property
     def drawn(self):
@@ -252,11 +338,6 @@ class Molecule(object):
         """
         return self._drawn
 
-    # drawn is read only
-    @drawn.setter
-    def drawn(self, value):
-        print('Not allowed to edit drawn list.')
-
     @property
     def rot_axis(self):
         """
@@ -264,9 +345,9 @@ class Molecule(object):
         - figure dimensions are adjusted based on rot_axis
         OPTIONS:
         - None: draw figure based only on current view
-        - x (left-to-right)
-        - y (bot-to-top)
-        - z (counter-clockwise)
+        - x (top-to-bot)
+        - y (left-to-right)
+        - z (counterclockwise)
         - can also add a '-' to change direction!
           e.g. '-z' causes clockwise rotation
         """
@@ -347,7 +428,7 @@ class Molecule(object):
         """
         self.remove('all')
 
-    def draw(self, items=['atoms', 'bonds', 'labels'], force=False):
+    def draw(self, items=None, force=False):
         """
         Draws multiple object types at once
         - Default: draws atoms, bonds, and labels (if any specified)
@@ -364,6 +445,10 @@ class Molecule(object):
         - force (bool): if True, all items are forced to redraw
                         (Default: False)
         """
+        # defaults to drawn list
+        if items is None:
+            items = self._drawn.copy()
+
         # items must be a list
         if not isinstance(items, list) or items == []:
             return
@@ -383,22 +468,42 @@ class Molecule(object):
         - force (bool): if True, atoms are forced to redraw
                         (Default: False)
         """
-        # determine if drawing or updating
-        update = bool(len(self.atom_objs))
 
-        # don't redraw if positions haven't changed
-        if update:
-            if (self.pos == self.atoms.positions).all():
-                if not force:
-                    return
-            else:
-                self.pos = self.atoms.positions.copy()
+        # remove atoms if forcing to redraw
+        if force:
+            [i.remove() for i in self.atom_objs]
+            self.fig.canvas.draw()
+            self.atom_objs = []
+
+        # determine if drawing or updating
+        update = False
+        if (self.pos != self.atoms.positions).any():
+            update = True
+            self.pos = self.atoms.positions.copy()
+        if self._scale != self._prevscale:
+            update = True
+            self.radii = covalent_radii[self.atoms.numbers] * self._scale
+            self._prevscale = self._scale
+            if 'bonds' in self._drawn:
+                self.draw_bonds(force=True)
+
+        if self._colors != self._prevcolors:
+            update = True
+            self._prevcolors = self._colors
+
+        # don't redraw if params haven't changed
+        if self.atom_objs:
+            if not (update or force):
+                return
+        else:
+            force = True
 
         # create atom patches and add to ax
         for i, a in enumerate(self.atoms):
             # update atom objects
-            if update:
+            if update and not force:
                 self.atom_objs[i].set_facecolor(self._colors[i])
+                self.atom_objs[i].radius = self.radii[i]
                 self.atom_objs[i].center = (a.x, a.y)
                 self.atom_objs[i].zorder = a.z
             # create atom object patches
@@ -407,6 +512,7 @@ class Molecule(object):
                             (a.x, a.y),
                             radius=self.radii[i],
                             facecolor=self._colors[i],
+                            alpha=self._alphas[i],
                             edgecolor='k',
                             linewidth=self.scaled_borderwidth,
                             zorder=a.z)
@@ -418,7 +524,7 @@ class Molecule(object):
         if 'atoms' not in self._drawn:
             self._drawn.append('atoms')
 
-    def draw_bonds(self, bond_color='white', bond_edgecolor='k',
+    def draw_bonds(self, bond_color=None, bond_edgecolor=None,
                    recalc_bonds=None, force=False):
         """
         Draw bonds or update bond positions
@@ -440,10 +546,11 @@ class Molecule(object):
         update = bool(len(self.bond_objs))
 
         # if new bond colors, force a redraw
-        if self.bond_color != bond_color:
+        if self.bond_color != bond_color and bond_color is not None:
             self.bond_color = bond_color
             force = True
-        if self.bond_edgecolor != bond_edgecolor:
+        if (self.bond_edgecolor != bond_edgecolor and
+           bond_edgecolor is not None):
             self.bond_edgecolor = bond_edgecolor
             force = True
 
@@ -498,14 +605,19 @@ class Molecule(object):
             # use avg z for zorder
             zorder = (xy1[2] + xy2[2]) / 2
 
+            # set alpha value of bond to lowest alpha atom
+            alpha = min(self.alphas[b[0]], self.alphas[b[1]])
+
             if update:
                 # update bond outline
                 self.bond_objs[2 * i].set_data((x, y))
                 self.bond_objs[2 * i].set_zorder(zorder - 0.001)
+                self.bond_objs[2 * i].set_alpha(alpha)
 
                 # update bond
                 self.bond_objs[2 * i + 1].set_data((x, y))
                 self.bond_objs[2 * i + 1].set_zorder(zorder)
+                self.bond_objs[2 * i + 1].set_alpha(alpha)
             else:
                 # draw thinner white line over black line
                 # to create bordered bonds
@@ -515,6 +627,7 @@ class Molecule(object):
                         zorder=zorder - 0.001,
                         color=self.bond_edgecolor,
                         lw=self.scaled_bond_width,
+                        alpha=alpha,
                         solid_capstyle='round')
 
                 # draw bond fill
@@ -523,6 +636,7 @@ class Molecule(object):
                         y,
                         zorder=zorder,
                         color=self.bond_color,
+                        alpha=alpha,
                         lw=self.scaled_bond_fill,
                         solid_capstyle='round')
 
@@ -534,7 +648,7 @@ class Molecule(object):
         if 'bonds' not in self._drawn:
             self._drawn.append('bonds')
 
-    def draw_labels(self, labels=None, force=False):
+    def draw_labels(self, labels=None, label_size=None, force=False):
         """
         Draw labels or update label position
 
@@ -562,12 +676,16 @@ class Molecule(object):
         # determine if drawing or updating
         update_labels = bool(len(self.label_objs))
 
+        if label_size is not None:
+            self.label_size = label_size
+
         for i, a in enumerate(self.atoms):
             if update_labels:
                 self.label_objs[i].set_text(self._labels[i])
                 self.label_objs[i].set_x(a.x)
                 self.label_objs[i].set_y(a.y)
                 self.label_objs[i].set_zorder(a.z + 0.001)
+                self.label_objs[i].set_size(self._label_size)
             else:
                 ann = self.ax.annotate(
                             self._labels[i],
@@ -575,7 +693,7 @@ class Molecule(object):
                             zorder=a.z + 0.001,
                             ha='center',
                             va='center',
-                            fontsize=15)
+                            fontsize=self._label_size)
                 # add annotation to label_objs list
                 self.label_objs.append(ann)
 
@@ -591,7 +709,10 @@ class Molecule(object):
                                   - can also give str of single atom type
                                   - 'size': largest to smallest
                                   - 'size_r': smallest to largest
-                                  (Default: None (alphabetical order))
+                                  - 'alpha': alphabetical order
+                                  - 'atomic': atomic number
+                                  - None: atomic number
+                                  (Default: size)
         - max_ms (int): scales legend such that largest atom type
                         is represented with markersize = <max_ms>
                         (Default: 16 pts)
@@ -610,38 +731,35 @@ class Molecule(object):
         if 'legend' in self._drawn:
             # redraw legend if different leg_order
             if (isinstance(leg_order, str) and
-               leg_order != self.leg_order and
-               leg_order is not None):
+               leg_order != self.leg_order):
                 self._drawn.remove('legend')
-                self.leg_order = leg_order
+                self.leg_order = leg_order.lower()
             elif not force:
                 return
 
-        if self.leg_order is None:
-            # default leg_order is alphabetical
-            if leg_order is None:
-                self.leg_order = 'alphabetical'
-            else:
-                # track current legend order
-                self.leg_order = leg_order
         elif leg_order is not None:
-            self.leg_order = leg_order
+            self.leg_order = leg_order.lower()
 
         # create an ordered, unique list of atom types
         symbols = sorted(set(self.atoms.symbols))
 
         # use custom legend order if given
-        if (isinstance(self.leg_order, str) and
-           self.leg_order != 'alphabetical'):
+        if isinstance(self.leg_order, str):
+            # symbols are already in alphabetical order
+            if self.leg_order == 'alpha':
+                pass
             # order legend by size
-            if self.leg_order in ['size', 'size_r']:
+            elif self.leg_order in ['size', 'size_r']:
                 symbols = sorted(
-                                symbols,
-                                key=lambda z: list(covalent_radii)[
-                                    chemical_symbols.index(z)],
-                                reverse=self.leg_order == 'size')
+                            symbols,
+                            key=lambda z: list(covalent_radii)[
+                                chemical_symbols.index(z)],
+                            reverse=self.leg_order == 'size')
+            # sort by atomic number
+            elif self.leg_order == 'number':
+                symbols = sorted(symbols, key=chemical_symbols.index)
             else:
-                raise ValueError("Unable to hangle leg_order "
+                raise ValueError("Unable to handle leg_order "
                                  "= %s" % self.leg_order)
         if isinstance(self.leg_order, list) or isinstance(self.leg_order,
                                                           np.ndarray):
@@ -743,6 +861,7 @@ class Molecule(object):
 
         # rescale colors
         if remake_color:
+            print('checking colors!')
             self._check_colors(self._cb_values)
 
         # add in colorbar axis
@@ -793,6 +912,7 @@ class Molecule(object):
                 a.remove()
             self.atom_objs = []
             self._drawn.remove('atoms')
+            self.fig.canvas.draw()
 
     def remove_bonds(self):
         """
@@ -821,6 +941,7 @@ class Molecule(object):
             self.legend.remove()
             self.legend = None
             self._drawn.remove('legend')
+            self.init_fig()
 
     def remove_colorbar(self):
         """
@@ -830,19 +951,51 @@ class Molecule(object):
             self.fig.delaxes(self.cb_ax)
             self.cb_ax = None
             self._drawn.remove('colorbar')
+            self.init_fig()
 
-    def smart_rotate(self):
+    def smart_rotate(self, opt_angle=False):
         """
         Applies "smart" rotation to molecule
         - attempts to find the best viewing angle using PCA (love this idea)
-        """
-        new_pos, self.transform = utils.pca(self.atoms.positions.copy(),
-                                            return_transform=True)
 
-        self.atoms.positions = new_pos.copy()
+        KArgs:
+        - opt_angle: Finds angle to rotate atoms about z-axis to maximize
+                     x and y distance of atoms
+                     - molecule is "squared off", which may give a better
+                       overall presentation for some systems
+        """
+        # TODO: correct transformation matrix from extra step
+        # in new smart_rotate
+        self.atoms = utils.smart_rotate_atoms(self.atoms, opt_angle=opt_angle)
+
+        # new_pos, self.transform = utils.pca(self.atoms.positions.copy(),
+        #                                     return_transform=True)
+
+        # self.atoms.positions = new_pos.copy()
 
         # redraw figure
         self.redraw()
+
+    def custom_rotate(self, rot_commands):
+        """
+        Applies an ordered list of rotation commands to molecule
+        - list should have the form [angle1, x|y|z, angle2, x|y|z, ...]
+        - rotations are applied sequentially and different orders will lead
+          to different results
+
+        Args:
+        - rot_commands (list): list of ordered rotation commands to apply
+                               - [angle, (x|y|z), angle, (x|y|z), ...]
+        """
+        # store current rotation axis
+        rot_axis = self.rot_axis
+
+        # apply the rotations sequentially
+        for angle, axis in zip(rot_commands[::2], rot_commands[1::2]):
+            self.rotate(angle, axis)
+
+        # set rotation axis back to original
+        self.rot_axis = rot_axis
 
     def add_param(self, value):
         if value not in self.fig_params:
@@ -865,6 +1018,8 @@ class Molecule(object):
         - <i> can also be cartesian coordinates
 
         Args:
+        - i (str): atom element to anchor - matches first element in list
+        - i == 'center': closest atom to center of position (COP)
         - i (int): index of atom that should be translated to origin
         - i (list): cartesian coordinates that should be translated to origin
         """
@@ -873,14 +1028,40 @@ class Molecule(object):
                 self.atoms.positions -= list(i)
             else:
                 raise ValueError('not cartesian coordinates')
-        except:
+        except Exception:
+            if isinstance(i, str):
+                if i.title() in self.atoms.symbols:
+                    i = np.where(self.atoms.symbols == i.title())[0][0]
+                elif i.isdigit():
+                    i = int(i)
+                elif i.lower() == 'center':
+                    # ensure that molecule's center of position is at origin
+                    self.atoms.positions -= self.atoms.positions.mean(0)
+
+                    # don't need to square root since order won't change
+                    dists = (self.atoms.positions**2).sum(1)
+
+                    # find closest atom to COP
+                    i = np.where(dists == dists.min())[0][0]
+
             if 0 <= i < len(self):
+                # store index of anchored atom
+                self.anchored_atom = i
+
+                # shift anchored atom to origin
                 self.atoms.positions -= self.atoms[i].position
+
                 # recalculate axis boundaries
                 self.init_fig()
                 self.add_param('anchor')
             else:
                 print('Invalid index given to anchor')
+
+    def center(self):
+        """
+        Center atoms by center-of-position (COP)
+        """
+        self.anchor(self.atom.positions.mean(0))
 
     def rotate(self, angle, rot_axis=None):
         """
@@ -902,10 +1083,10 @@ class Molecule(object):
             self.rot_axis = 'y'
 
         try:
-            self.atoms.rotate(angle, v=self.rot_axis,
+            self.atoms.rotate(float(angle), v=self.rot_axis,
                               center=(0, 0, 0))
             self.update()
-        except:
+        except Exception:
             print("Unable to rotate - make sure angle "
                   "and rot_axis (if given) are valid")
 
@@ -933,10 +1114,10 @@ class Molecule(object):
             raise TypeError('init_fig must first be called')
 
     def save(self, path=None, overwrite=False, max_px=600, transparent=False,
-             optimize=False):
+             optimize=False, quiet=False):
         """
         Save the current figure
-        - if saving as *.png, method attempts to optimize image
+        - default = *.png
         - can save as *.svg vector graphic
         - supports all extensions supported by plt.Figure.savefig
 
@@ -957,7 +1138,13 @@ class Molecule(object):
         - optimize (bool): optimizes png if no colorbar is drawn
                            - NOTE: could result in some loss of quality
                            (Default: False)
+        - quiet (bool): if True, supress output to console
         """
+        # inform user of attempt to save
+        if not quiet:
+            print('Saving %s...' % path, end='\r')
+
+        # calculate dpi based on max_px and 5" max dimension of mpl figure
         dpi = max_px / 5
 
         if path is None:
@@ -987,6 +1174,10 @@ class Molecule(object):
             im2.save(path, optimize=True)
         else:
             self.fig.savefig(path, transparent=transparent, dpi=dpi)
+
+        # inform user of successful save
+        if not quiet:
+            print('Successfully saved: %s' % path)
 
     def update(self, force=False, recalc_bonds=None, redraw=None):
         """
@@ -1064,6 +1255,8 @@ class Molecule(object):
             # TODO: Implement self.fig_params for
             # more descriptive default gif name
             # path = '%s-%s.gif' % (self.name, '-'.join(self.fig_params))
+        elif os.path.isdir(path):
+            path = os.path.join(path, self.name + '.gif')
 
         # ensure path ends with .gif
         if not path.endswith('.gif'):
@@ -1112,7 +1305,7 @@ class Molecule(object):
                 print('   Saving frame: %03i' % (i + 1), end='\r')
                 self.save(os.path.join(frame_path,
                                        self.name + '_%03i.png' % (i + 1)),
-                          max_px=max_px, optimize=optimize_gif)
+                          max_px=max_px, optimize=optimize_gif, quiet=True)
                 self.rotate(rot)
         # else make gif with matplotlib.animation and image magick
         else:
@@ -1222,8 +1415,7 @@ class Molecule(object):
         failed = True
 
         if str(value).lower() == 'random':
-            self._colors = [[random.random() for i in range(3)]
-                            for j in range(len(self))]
+            self._colors = list(np.random.random((len(self), 3)))
             failed = False
             self.block_legend = True
         # resort to default colors
@@ -1238,24 +1430,16 @@ class Molecule(object):
                 failed = False
             except ValueError:
                 pass
+        # convert dict of color specs
         elif isinstance(value, dict):
-            colors_dict = {k.title(): value[k] for k in value.copy()}
+            value, allow_legend = self._dict_to_list(value, self._colors)
+            self.block_legend = not allow_legend
 
-            # find atom types that are not in atoms object
-            not_found = [c for c in colors_dict
-                         if c.title() not in self.atoms.symbols]
-            if not_found:
-                print('%s do not match atom types.' % (', '.join(not_found)))
-
-            # use combination of color_dict and jmol_colors
-            try:
-                self._colors = [mcolors.to_rgba(colors_dict.get(i.symbol,
-                                list(jmol_colors[i.number])))
-                                for i in self.atoms]
-                failed = False
-            except ValueError:
-                pass
-
+            for i in range(len(value)):
+                if isinstance(value[i], str):
+                    value[i] = list(mcolors.to_rgba(value[i]))[:-1]
+            self._colors = value
+            failed = False
         elif type(value) in [list, np.ndarray]:
             # if values (ex charge), create Red Blue colormap
             try:
@@ -1289,7 +1473,7 @@ class Molecule(object):
                 self.block_colorbar = False
                 failed = False
             # else see if list contains strings
-            except:
+            except Exception:
                 # if length is the same, try to convert items to valid colors
                 if len(value) == len(self):
                     try:
@@ -1316,8 +1500,8 @@ class Molecule(object):
             raise ValueError("length of colors must be equal to # atoms")
 
         # redraw atoms if colors have changed
-        if self._colors != old_colors and 'atoms' in self._drawn:
-            self.update(force=True, redraw=['atoms', 'legend'])
+        if self._colors != self._prevcolors and 'atoms' in self._drawn:
+            self.update(redraw=['atoms', 'legend'])
 
     def _check_labels(self, value):
         """
@@ -1342,7 +1526,8 @@ class Molecule(object):
                     self._labels = list(self._cb_values)
                 # atomic charges
                 elif value == 'charges':
-                    self._labels = list(self.atoms.get_initial_charges())
+                    self._labels = [round(i, 2)
+                                    for i in self.atoms.get_initial_charges()]
                 else:
                     print('"%s" not supported for labels' % value)
             elif len(value) == len(self.atoms):
@@ -1354,3 +1539,57 @@ class Molecule(object):
         # redraw atoms if labels have changed
         if self._labels != old_labels and 'atoms' in self._drawn:
             self.draw_atoms(force=True)
+
+    def _dict_to_list(self, prop_dict, default_ls):
+        """
+        Converts dict of custom properties into array of values for each atom
+        - works for colors and alpha values
+
+        Args:
+        prop_dict (dict): dictionary of properties for certain atoms
+                          - key = chem symbol: all atoms of that symbol
+                          - key = index: just that atom index
+        default_ls (list): default values for atoms in molecule
+
+        Returns:
+        (np.ndarray): 1D array of custom and default values, ordered by atom
+        allow_legend (bool): if True, each atom type has a consistent value
+        """
+        val_ls = copy.deepcopy(default_ls)
+
+        # track or properties are consistant for each atom type
+        allow_legend = True
+
+        # track values for each atom type if consistent
+        const_val_dict = {}
+
+        arr = np.array(val_ls)
+        # see if items are iterable (i.e. arr is larger than 1D)
+        nd = len(arr.shape) > 1
+
+        for s in set(self.atoms.symbols):
+            uniq = np.unique(arr[self.atoms.symbols == s], axis=0)
+            if len(uniq) > 1:
+                allow_legend = False
+                break
+            const_val_dict[s] = uniq.tolist()[0]
+
+        # iterate over symbols first, then atom indices
+        for k in sorted(prop_dict, key=lambda i: [not isinstance(i, str), i]):
+            # if chemical symbol or R (equivalent to C and H)
+            if isinstance(k, str) and (k.title() in chemical_symbols or
+               k.upper() == 'R'):
+                # find C and H atoms
+                if k.upper() == 'R':
+                    inds = np.where(np.isin(self.atoms.symbols, ['C', 'H']))[0]
+                else:
+                    inds = np.where(self.atoms.symbols == k.title())[0]
+                for i in inds:
+                    val_ls[i] = prop_dict[k]
+            elif ((isinstance(k, int) or str(k).isdigit()) and
+                  (-1 < int(k) < len(val_ls))):
+                val_ls[int(k)] = prop_dict[k]
+                if prop_dict[k] != const_val_dict[self.atoms.symbols[int(k)]]:
+                    allow_legend = False
+
+        return val_ls, allow_legend
