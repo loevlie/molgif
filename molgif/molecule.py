@@ -372,6 +372,8 @@ class Molecule(object):
                          - NOTE: padding value is dependent on size of system
                          (Default: 2)
         """
+        plt.rcParams['axes.facecolor']='white'
+        plt.rcParams['savefig.facecolor']='white'
         if self.padding is None:
             self.padding = padding
 
@@ -1328,7 +1330,7 @@ class Molecule(object):
 
         if optimize_gif:
             print(' Creating optimized gif...', end='\r')
-            subprocess.call(['magick', 'convert', '-delay', str(100 / fps),
+            subprocess.call(['magick', 'convert', '-dispose', 'previous', '-delay', str(100 / fps),
                              os.path.join(frame_path, '*.png'), path])
 
             # delete temp folder and files if only making optimized gif
